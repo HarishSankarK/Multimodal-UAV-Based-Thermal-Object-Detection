@@ -1,0 +1,33 @@
+# YOLOv11 multimodal fusion model configuration
+model:
+  name: yolov11_fusion
+  num_classes: 4
+  classes: ['person', 'rider', 'bicycle', 'car']
+  img_size: 640
+  anchors:
+    - [[10, 13], [16, 30], [33, 23]]  # Scale 1 (80x80)
+    - [[30, 61], [62, 45], [59, 119]]  # Scale 2 (40x40)
+    - [[116, 90], [156, 198], [373, 326]]  # Scale 3 (20x20)
+  backbone:
+    type: DualBackbone
+    in_channels: 3
+  neck:
+    type: PANet
+    in_channels: [256, 512, 1024]
+  head:
+    type: YOLOv11Head
+    num_anchors: 3
+    in_channels: [256, 512, 1024]
+  fusion:
+    type: concatenate
+    reduction_layers: [256, 512, 1024]
+
+loss:
+  box_weight: 0.05
+  obj_weight: 1.0
+  cls_weight: 0.5
+  iou_type: ciou  # Options: iou, giou, diou, ciou
+
+paths:
+  pretrained_weights: ""  # Path to pretrained weights (e.g., checkpoints/yolov11_fusion_best.pt)
+  output_dir: "checkpoints"

@@ -1,0 +1,44 @@
+{
+  "smod": {
+    "train": {
+      "rgb": "smod/images/train/rgb/",
+      "ir": "smod/images/train/ir/"
+    },
+    "val": {
+      "rgb": "smod/images/val/rgb/",
+      "ir": "smod/images/val/ir/"
+    },
+    "test": {
+      "rgb": "smod/images/test/rgb/",
+      "ir": "smod/images/test/ir/"
+    },
+    "source": "smod"
+  },
+  "hit_uav": {
+    "train": {
+      "rgb": "hit_uav/images/train/"
+    },
+    "val": {
+      "rgb": "hit_uav/images/val/"
+    },
+    "test": {
+      "rgb": "hit_uav/images/test/"
+    },
+    "source": "hit_uav"
+  },
+  "dronergbt": {
+    "train": {
+      "rgb": "dronergbt/images/train/rgb/",
+      "ir": "dronergbt/images/train/ir/"
+    },
+    "val": {
+      "rgb": "dronergbt/images/val/rgb/",
+      "ir": "dronergbt/images/val/ir/"
+    },
+    "test": {
+      "rgb": "dronergbt/images/test/rgb/",
+      "ir": "dronergbt/images/test/ir/"
+    },
+    "source": "dronergbt"
+  }
+}
