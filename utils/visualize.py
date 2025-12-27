@@ -34,7 +34,9 @@ def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, 
             
             # Decode box coordinates
             xy = (torch.sigmoid(pred[:, :2]) + torch.stack([grid_x, grid_y], dim=-1)) * strides[i]
-            wh = torch.exp(pred[:, 2:4]) * anchors[i].to(pred.device)
+            # Convert anchors to tensor if needed
+            anchor_tensor = torch.tensor(anchors[i], device=pred.device, dtype=torch.float32)
+            wh = torch.exp(pred[:, 2:4]) * anchor_tensor
             boxes = torch.cat([xy - wh / 2, xy + wh / 2], dim=-1)  # [x_min, y_min, x_max, y_max]
             
             # Decode objectness and class scores
@@ -64,13 +66,13 @@ def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, 
     
     return detections
 
-def draw_boxes(image, boxes, labels, class_names=['person', 'rider', 'bicycle', 'car'], colors=None):
+def draw_boxes(image, boxes, labels=None, class_names=['person', 'rider', 'bicycle', 'car'], colors=None):
     """
     Draw bounding boxes and labels on an image.
     Args:
         image (np.ndarray): Image in RGB format (H, W, 3).
         boxes (torch.Tensor): Tensor of shape [N, 6] with [x_min, y_min, x_max, y_max, conf, class_id].
-        labels (list): List of class names.
+        labels (list, optional): List of class names (not used if boxes contain class_id).
         class_names (list): Names of classes.
         colors (list): List of colors per class (optional).
     Returns:

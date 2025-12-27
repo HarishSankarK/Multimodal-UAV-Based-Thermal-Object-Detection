@@ -149,38 +149,35 @@ def apply_mosaic(images, images_ir, bboxes, labels, img_size=640):
     
     return mosaic_rgb, mosaic_ir, all_bboxes, all_labels
 
-def get_transforms(config, training=True):
-    """
-    Get transforms based on configuration.
-    Args:
-        config (dict): Configuration dictionary.
-        training (bool): Whether to apply training augmentations.
-    Returns:
-        callable: Transform function compatible with albumentations-style calls.
-    """
-    def transform(image=None, image_ir=None, bboxes=None, labels=None):
+class TransformFunction:
+    """Pickleable transform class for multiprocessing compatibility."""
+    def __init__(self, img_size, training=True):
+        self.img_size = img_size
+        self.training = training
+    
+    def __call__(self, image=None, image_ir=None, bboxes=None, labels=None):
         image_rgb = np.array(image, dtype=np.uint8)
         image_ir = np.array(image_ir, dtype=np.uint8) if image_ir is not None else None
         bboxes = np.array(bboxes, dtype=np.float32)
         labels = np.array(labels, dtype=np.int64)
         
         # Resize and normalize
-        image_rgb, scale_factor, offset = resize_image(image_rgb, (config['data']['img_size'], config['data']['img_size']))
-        bboxes = adjust_boxes(bboxes, scale_factor, offset, config['data']['img_size'])
+        image_rgb, scale_factor, offset = resize_image(image_rgb, (self.img_size, self.img_size))
+        bboxes = adjust_boxes(bboxes, scale_factor, offset, self.img_size)
         image_rgb = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
         
         if image_ir is not None:
-            image_ir, _, _ = resize_image(image_ir, (config['data']['img_size'], config['data']['img_size']))
+            image_ir, _, _ = resize_image(image_ir, (self.img_size, self.img_size))
             image_ir = torch.from_numpy(image_ir).permute(2, 0, 1).float() / 255.0
         
-        if training:
+        if self.training:
             # Apply random horizontal flip
             if random.random() < 0.5:
                 image_rgb = torch.flip(image_rgb, dims=[2])
                 if image_ir is not None:
                     image_ir = torch.flip(image_ir, dims=[2])
                 if len(bboxes) > 0:
-                    bboxes[:, [0, 2]] = config['data']['img_size'] - bboxes[:, [2, 0]]
+                    bboxes[:, [0, 2]] = self.img_size - bboxes[:, [2, 0]]
             
             # Apply color jitter (simple brightness/contrast)
             if random.random() < 0.5:
@@ -208,8 +205,17 @@ def get_transforms(config, training=True):
             'bboxes': torch.from_numpy(bboxes).float() if len(bboxes) > 0 else torch.zeros((0, 4), dtype=torch.float32),
             'labels': torch.from_numpy(labels).long() if len(labels) > 0 else torch.zeros((0,), dtype=torch.int64)
         }
-    
-    return transform
+
+def get_transforms(config, training=True):
+    """
+    Get transforms based on configuration.
+    Args:
+        config (dict): Configuration dictionary.
+        training (bool): Whether to apply training augmentations.
+    Returns:
+        callable: Transform function compatible with albumentations-style calls.
+    """
+    return TransformFunction(config['data']['img_size'], training=training)
 
 def rotate_boxes(boxes, angle, cx, cy):
     """

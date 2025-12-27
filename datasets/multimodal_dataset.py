@@ -50,11 +50,27 @@ class MultimodalDataset(torch.utils.data.Dataset):
             if cat['name'] in self.category_map
         }
 
-        # Image paths
-        self.rgb_dir = os.path.join(root_dir, dataset_name, 'images', split, 'rgb')
-        self.ir_dir = os.path.join(
-            root_dir, dataset_name, 'images', split, 'ir'
-        ) if self.modalities[dataset_name].get(split, {}).get('ir') else None
+        # Image paths - use modalities.json to determine correct paths
+        rgb_path = self.modalities[dataset_name].get(split, {}).get('rgb', '')
+        if rgb_path:
+            # Remove dataset_name prefix if present and construct full path
+            if rgb_path.startswith(dataset_name + '/'):
+                self.rgb_dir = os.path.join(root_dir, rgb_path.rstrip('/'))
+            else:
+                self.rgb_dir = os.path.join(root_dir, dataset_name, rgb_path.rstrip('/'))
+        else:
+            # Fallback to default structure
+            self.rgb_dir = os.path.join(root_dir, dataset_name, 'images', split, 'rgb')
+        
+        # IR directory
+        ir_path = self.modalities[dataset_name].get(split, {}).get('ir', '')
+        if ir_path:
+            if ir_path.startswith(dataset_name + '/'):
+                self.ir_dir = os.path.join(root_dir, ir_path.rstrip('/'))
+            else:
+                self.ir_dir = os.path.join(root_dir, dataset_name, ir_path.rstrip('/'))
+        else:
+            self.ir_dir = None
 
     def __len__(self):
         return len(self.image_ids)

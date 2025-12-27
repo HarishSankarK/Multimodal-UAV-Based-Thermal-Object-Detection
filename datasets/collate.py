@@ -48,8 +48,21 @@ def collate_fn(batch, mosaic_prob=0.5, img_size=640):
     # Stack RGB images
     rgb_images = torch.stack(rgb_images, dim=0)
 
-    # Stack IR images if present
-    ir_images = torch.stack([img for img in ir_images if img is not None], dim=0) if any(img is not None for img in ir_images) else None
+    # Stack IR images if present (handle None values by creating zero tensors)
+    if any(img is not None for img in ir_images):
+        # Replace None with zero tensors matching the shape of non-None images
+        ir_shape = None
+        for img in ir_images:
+            if img is not None:
+                ir_shape = img.shape
+                break
+        if ir_shape is not None:
+            ir_images = [img if img is not None else torch.zeros(ir_shape, dtype=rgb_images.dtype) for img in ir_images]
+            ir_images = torch.stack(ir_images, dim=0)
+        else:
+            ir_images = None
+    else:
+        ir_images = None
 
     # Pad boxes and labels
     max_num_boxes = max(len(boxes) for boxes in boxes_list)

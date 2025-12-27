@@ -55,14 +55,16 @@ def evaluate_coco(model, dataloader, annotation_file, anchors, device='cuda'):
         detections = decode_predictions(predictions, anchors, conf_thres=0.5, iou_thres=0.5)
         
         for img_id, dets in zip(image_ids, detections):
-            for det in dets:
-                x_min, y_min, x_max, y_max, conf, cls = det.cpu().numpy()
-                coco_dt.append({
-                    'image_id': int(img_id),
-                    'category_id': int(cls) + 1,  # Assuming 1-based COCO category IDs
-                    'bbox': [float(x_min), float(y_min), float(x_max - x_min), float(y_max - y_min)],
-                    'score': float(conf)
-                })
+            if dets.shape[0] > 0:  # Check if there are any detections
+                dets_np = dets.cpu().numpy()
+                for det in dets_np:
+                    x_min, y_min, x_max, y_max, conf, cls = det
+                    coco_dt.append({
+                        'image_id': int(img_id),
+                        'category_id': int(cls) + 1,  # Assuming 1-based COCO category IDs
+                        'bbox': [float(x_min), float(y_min), float(x_max - x_min), float(y_max - y_min)],
+                        'score': float(conf)
+                    })
     
     # Load detections into COCO format
     coco_dt = coco.loadRes(coco_dt)
@@ -84,7 +86,7 @@ if __name__ == "__main__":
     from datasets.collate import collate_fn
     from torch.utils.data import DataLoader
 
-    root_dir = r"D:\User\Videos\CE\project\Reference papers\multimodal_yolov11\data"
+    root_dir = "data"  # Relative path to data directory
     annotation_file = os.path.join(root_dir, "smod", "annotations", "instances_val.json")
     anchors = [np.array([[10, 13], [16, 30], [33, 23]]),
                np.array([[30, 61], [62, 45], [59, 119]]),

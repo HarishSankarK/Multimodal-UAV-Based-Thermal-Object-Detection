@@ -67,7 +67,7 @@ def assign_anchors_to_scales(anchors, num_scales=3):
 
 if __name__ == "__main__":
     # Example usage
-    root_dir = r"D:\User\Videos\CE\project\Reference papers\multimodal_yolov11\data"
+    root_dir = "data"  # Relative path to data directory
     annotation_files = [
         os.path.join(root_dir, "smod", "annotations", "instances_train.json"),
         os.path.join(root_dir, "hit_uav", "annotations", "instances_train.json"),

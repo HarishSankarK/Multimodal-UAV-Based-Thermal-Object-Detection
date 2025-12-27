@@ -74,24 +74,28 @@ class GFEM(nn.Module):
         return self.self_attention(x)
 
 class SGGFNet(nn.Module):
-    """SGGF-Net backbone integrating GFEM."""
-    def __init__(self, in_channels=3):
+    """SGGF-Net backbone integrating GFEM - optimized for speed."""
+    def __init__(self, in_channels=3, fast_mode=False):
         super(SGGFNet, self).__init__()
+        self.fast_mode = fast_mode
         self.stem = ConvBlock(in_channels, 64, 6, stride=2, padding=2)
-        self.stage1 = CSPBlock(64, 128, 3)
+        # Reduced bottlenecks for faster training: 3 -> 1, 9 -> 3, 9 -> 3, 3 -> 1
+        bottleneck_counts = (1, 3, 3, 1) if fast_mode else (3, 9, 9, 3)
+        self.stage1 = CSPBlock(64, 128, bottleneck_counts[0])
         self.stage2 = nn.Sequential(
             ConvBlock(128, 256, 3, stride=2, padding=1),
-            CSPBlock(256, 256, 9)
+            CSPBlock(256, 256, bottleneck_counts[1])
         )
         self.stage3 = nn.Sequential(
             ConvBlock(256, 512, 3, stride=2, padding=1),
-            CSPBlock(512, 512, 9)
+            CSPBlock(512, 512, bottleneck_counts[2])
         )
         self.stage4 = nn.Sequential(
             ConvBlock(512, 1024, 3, stride=2, padding=1),
-            CSPBlock(1024, 1024, 3)
+            CSPBlock(1024, 1024, bottleneck_counts[3])
         )
-        self.gfem = GFEM(1024)  # Apply GFEM to the deepest feature map for global fusion
+        # Disable GFEM in fast mode for speed
+        self.gfem = GFEM(1024) if not fast_mode else nn.Identity()
 
     def forward(self, x):
         x = self.stem(x)
@@ -104,10 +108,10 @@ class SGGFNet(nn.Module):
 
 class DualBackbone(nn.Module):
     """Dual-stream backbone for RGB and IR inputs."""
-    def __init__(self):
+    def __init__(self, fast_mode=False):
         super(DualBackbone, self).__init__()
-        self.rgb_backbone = SGGFNet(in_channels=3)
-        self.ir_backbone = SGGFNet(in_channels=3)  # IR converted to 3 channels in dataset
+        self.rgb_backbone = SGGFNet(in_channels=3, fast_mode=fast_mode)
+        self.ir_backbone = SGGFNet(in_channels=3, fast_mode=fast_mode)  # IR converted to 3 channels in dataset
 
     def forward(self, rgb, ir=None):
         rgb_features = self.rgb_backbone(rgb)  # (s2, s3, s4)

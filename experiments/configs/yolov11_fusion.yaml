@@ -3,11 +3,11 @@ model:
   name: yolov11_fusion
   num_classes: 4
   classes: ['person', 'rider', 'bicycle', 'car']
-  img_size: 640
+  img_size: 416  # Reduced for faster training (can be increased to 640 for better accuracy)
   anchors:
-    - [[10, 13], [16, 30], [33, 23]]  # Scale 1 (80x80)
-    - [[30, 61], [62, 45], [59, 119]]  # Scale 2 (40x40)
-    - [[116, 90], [156, 198], [373, 326]]  # Scale 3 (20x20)
+    - [[7, 8], [10, 19], [21, 15]]  # Scale 1 (52x52 for 416) - scaled from 640 anchors
+    - [[19, 40], [40, 29], [38, 77]]  # Scale 2 (26x26 for 416)
+    - [[75, 58], [101, 128], [242, 211]]  # Scale 3 (13x13 for 416)
   backbone:
     type: DualBackbone
     in_channels: 3
@@ -23,9 +23,9 @@ model:
     reduction_layers: [256, 512, 1024]
 
 loss:
-  box_weight: 0.05
-  obj_weight: 1.0
-  cls_weight: 0.5
+  box_weight: 0.5  # Per paper: λ1 = 0.5 for bounding box regression
+  obj_weight: 1.0  # Per paper: λ2 = 1.0 for objectness
+  cls_weight: 1.0  # Per paper: λ3 = 1.0 for classification (was 0.5, updated to match paper)
   iou_type: ciou  # Options: iou, giou, diou, ciou
 
 paths:

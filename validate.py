@@ -9,15 +9,22 @@ from models.fusion_yolov11 import FusionYOLOv11
 from utils.metrics import evaluate_coco
 
 def main():
+    # Get the project root directory
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    
     # Load configurations
-    with open("experiments/configs/default.yaml", 'r') as f:
+    with open(os.path.join(project_root, "experiments/configs/default.yaml"), 'r') as f:
         config_default = yaml.safe_load(f)
-    with open("experiments/configs/yolov11_fusion.yaml", 'r') as f:
+    with open(os.path.join(project_root, "experiments/configs/yolov11_fusion.yaml"), 'r') as f:
         config_model = yaml.safe_load(f)
     
     # Merge configurations
     config = config_default.copy()
     config.update(config_model)
+    
+    # Resolve relative paths to absolute paths
+    if not os.path.isabs(config['data']['root_dir']):
+        config['data']['root_dir'] = os.path.join(project_root, config['data']['root_dir'])
     
     # Initialize device
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
@@ -26,8 +33,9 @@ def main():
     model = FusionYOLOv11(num_classes=config['model']['num_classes'], img_size=config['data']['img_size'])
     model.to(device)
     
-    # Load checkpoint
-    checkpoint_path = os.path.join(config['logging']['checkpoint_dir'], 'yolov11_fusion_best.pt')
+    # Resolve checkpoint path
+    checkpoint_dir = os.path.join(project_root, config['logging']['checkpoint_dir']) if not os.path.isabs(config['logging']['checkpoint_dir']) else config['logging']['checkpoint_dir']
+    checkpoint_path = os.path.join(checkpoint_dir, 'yolov11_fusion_best.pt')
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     
     # Initialize validation dataset and dataloader
@@ -47,10 +55,12 @@ def main():
     )
     
     # Evaluate on validation set
+    dataset_name = 'smod'
+    val_annotation_path = os.path.join(config['data']['root_dir'], dataset_name, 'annotations', 'instances_val.json')
     metrics = evaluate_coco(
         model,
         val_loader,
-        os.path.join(config['data']['root_dir'], config['data']['datasets'][0]['splits']['val']),
+        val_annotation_path,
         config['model']['anchors'],
         device
     )
