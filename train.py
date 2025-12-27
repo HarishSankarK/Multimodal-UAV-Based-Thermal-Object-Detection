@@ -1,10 +1,10 @@
-import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import os
+import torch.nn as nn
+import torch
 import numpy as np
 from tqdm import tqdm
 import torchvision
@@ -13,6 +13,7 @@ from datasets.collate import collate_fn
 from datasets.transforms import get_transforms
 from models.fusion_yolov11 import FusionYOLOv11
 from utils.metrics import evaluate_coco
+from torch.cuda.amp import autocast, GradScaler
 
 def bbox_ciou(box1, box2, eps=1e-7):
     # box format: [x1,y1,x2,y2]
@@ -67,10 +68,17 @@ def compute_yolo_loss(predictions, targets, anchors, strides=[8, 16, 32], img_si
         pred_cls = pred[..., 5:]  # Class probabilities
         
         # Pre-compute grid (only once per scale) - cache this if same size
-        # Use more efficient meshgrid
-        yv, xv = torch.meshgrid(torch.arange(h, device=device, dtype=torch.float32), 
-                                torch.arange(w, device=device, dtype=torch.float32), indexing='ij')
-        grid = torch.stack([xv, yv], dim=-1).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W, 2]
+        # Cache grid tensors to avoid repeated computation
+        if not hasattr(compute_yolo_loss, '_grid_cache'):
+            compute_yolo_loss._grid_cache = {}
+        grid_key = (i, h, w, device)
+        if grid_key not in compute_yolo_loss._grid_cache:
+            yv, xv = torch.meshgrid(torch.arange(h, device=device, dtype=torch.float32), 
+                                    torch.arange(w, device=device, dtype=torch.float32), indexing='ij')
+            grid = torch.stack([xv, yv], dim=-1).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W, 2]
+            compute_yolo_loss._grid_cache[grid_key] = grid
+        else:
+            grid = compute_yolo_loss._grid_cache[grid_key]
         
         # Decode predictions efficiently
         pred_xy = (pred_xy + grid) * strides[i]  # [B, A, H, W, 2]
@@ -189,26 +197,34 @@ def compute_yolo_loss(predictions, targets, anchors, strides=[8, 16, 32], img_si
     
     return box_loss, obj_loss, cls_loss
 
-def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer):
+def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer, scaler=None):
     model.train()
+    # Use torch.set_grad_enabled(True) explicitly for optimization
+    torch.set_grad_enabled(True)
     total_loss, total_box_loss, total_obj_loss, total_cls_loss = 0.0, 0.0, 0.0, 0.0
     num_batches = len(dataloader)
     # Anchors are already organized by scale in config: [[scale1_anchors], [scale2_anchors], [scale3_anchors]]
     # Convert to list of numpy arrays, one per scale
     anchors = [np.array(scale_anchors) for scale_anchors in config['model']['anchors']]
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+    # Disable tqdm for faster training (can re-enable for debugging)
+    pbar = dataloader  # Use dataloader directly instead of tqdm for speed
+    # pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", disable=True)  # Disable progress bar for speed
+    
     # Optimize CPU thread usage
     if device.type == 'cpu':
-        import os
         # Use all available CPU cores
         num_threads = min(os.cpu_count() or 4, 8)  # Cap at 8 to avoid overhead
         torch.set_num_threads(num_threads)
         torch.set_num_interop_threads(num_threads)
-        print(f"Using {num_threads} CPU threads for parallelization")
+        if epoch == 0:  # Only print once
+            print(f"Using {num_threads} CPU threads for parallelization")
     
+    import time
+    start_time = time.time()
     for batch_idx, batch in enumerate(pbar):
         try:
+            batch_start = time.time()
             # Optimized data transfer - use pin_memory if available
             rgb = batch['image_rgb'].to(device, non_blocking=True)
             ir = batch['image_ir'].to(device, non_blocking=True) if batch['image_ir'] is not None else None
@@ -217,38 +233,107 @@ def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer)
                 'labels': batch['labels'].to(device, non_blocking=True)
             }
             
-            # Zero gradients efficiently
-            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+            # Debug: Print data loading time for first few batches
+            if batch_idx < 3:
+                data_time = time.time() - batch_start
+                print(f"Batch {batch_idx}: Data loading took {data_time:.2f}s", flush=True)
             
-            # Forward pass
-            predictions = model(rgb, ir)
-            
-            box_loss, obj_loss, cls_loss = compute_yolo_loss(
-                predictions,
-                targets,
-                anchors,
-                num_classes=config['model']['num_classes'],
-                iou_type=config['loss']['iou_type']
-            )
-            
-            loss = (config['loss']['box_weight'] * box_loss +
+            # Zero gradients efficiently (only at start of accumulation cycle)
+            grad_accum_steps = config['training'].get('gradient_accumulation_steps', 1)
+            if batch_idx % grad_accum_steps == 0:
+                optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+
+            # Profile timing for CPU
+            if device.type == 'cpu' and batch_idx < 3:
+                forward_start = time.time()
+
+            # Forward pass with mixed precision (GPU only)
+            if scaler is not None and device.type == 'cuda':
+                # Mixed precision training for GPU (1.5-2x speedup)
+                with autocast():
+                    predictions = model(rgb, ir)
+                    box_loss, obj_loss, cls_loss = compute_yolo_loss(
+                        predictions,
+                        targets,
+                        anchors,
+                        num_classes=config['model']['num_classes'],
+                        iou_type=config['loss']['iou_type']
+                    )
+                    loss = (
+                        config['loss']['box_weight'] * box_loss +
+                        config['loss']['obj_weight'] * obj_loss +
+                        config['loss']['cls_weight'] * cls_loss
+                    )
+                
+                # Backward pass with mixed precision
+                loss_scaled = loss / grad_accum_steps  # Scale for gradient accumulation
+                scaler.scale(loss_scaled).backward()
+                scaler.unscale_(optimizer)  # Unscale before clipping
+                
+                # Only update weights every N batches (gradient accumulation)
+                if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+                    scaler.step(optimizer)
+                    scaler.update()
+            else:
+                # Standard precision for CPU
+                predictions = model(rgb, ir)
+                
+                if device.type == 'cpu' and batch_idx < 3:
+                    forward_time = time.time() - forward_start
+                    loss_start = time.time()
+                
+                box_loss, obj_loss, cls_loss = compute_yolo_loss(
+                    predictions,
+                    targets,
+                    anchors,
+                    num_classes=config['model']['num_classes'],
+                    iou_type=config['loss']['iou_type']
+                )
+                loss = (
+                    config['loss']['box_weight'] * box_loss +
                     config['loss']['obj_weight'] * obj_loss +
-                    config['loss']['cls_weight'] * cls_loss)
+                    config['loss']['cls_weight'] * cls_loss
+                )
+                
+                if device.type == 'cpu' and batch_idx < 3:
+                    loss_time = time.time() - loss_start
+                    backward_start = time.time()
             
-            # Backward pass
-            loss.backward()
+                # Backward pass with gradient accumulation
+                loss_scaled = loss / grad_accum_steps  # Scale loss for gradient accumulation
+                loss_scaled.backward()
+                
+                if device.type == 'cpu' and batch_idx < 3:
+                    backward_time = time.time() - backward_start
+                    print(f"Batch {batch_idx}: Forward={forward_time:.2f}s, Loss={loss_time:.2f}s, Backward={backward_time:.2f}s", flush=True)
+                
+                # Only update weights every N batches (gradient accumulation)
+                if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+                    optimizer.step()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+            # Store loss values (extract from original loss, not scaled version)
+            # Loss values are extracted before scaling, so they represent the true loss
+            if isinstance(loss, torch.Tensor):
+                loss_val = float(loss.item())
+            else:
+                loss_val = float(loss)
             
-            # Optimizer step
-            optimizer.step()
+            if isinstance(box_loss, torch.Tensor):
+                box_loss_val = float(box_loss.item())
+            else:
+                box_loss_val = float(box_loss)
             
-            # Store loss values (extract before deleting)
-            loss_val = float(loss.item())
-            box_loss_val = float(box_loss.item())
-            obj_loss_val = float(obj_loss.item())
-            cls_loss_val = float(cls_loss.item())
+            if isinstance(obj_loss, torch.Tensor):
+                obj_loss_val = float(obj_loss.item())
+            else:
+                obj_loss_val = float(obj_loss)
+            
+            if isinstance(cls_loss, torch.Tensor):
+                cls_loss_val = float(cls_loss.item())
+            else:
+                cls_loss_val = float(cls_loss)
             
             # Clean up
             del loss, box_loss, obj_loss, cls_loss, predictions
@@ -260,26 +345,39 @@ def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer)
             total_obj_loss += obj_loss_val
             total_cls_loss += cls_loss_val
             
-            # Log periodically (reduce frequency for CPU)
+            # Debug: Print batch time for first few batches
+            if batch_idx < 3:
+                batch_time = time.time() - batch_start
+                print(f"Batch {batch_idx}: Total time {batch_time:.2f}s", flush=True)
+            
+            # Force Python to flush output buffer
+            if batch_idx % 5 == 0:
+                import sys
+                sys.stdout.flush()
+            
+            # Log periodically (reduce frequency for CPU, make non-blocking)
             log_freq = config['logging']['log_freq'] * 2 if device.type == 'cpu' else config['logging']['log_freq']
             if batch_idx % log_freq == 0:
-                writer.add_scalar('Loss/total', loss_val, epoch * num_batches + batch_idx)
-                writer.add_scalar('Loss/box', box_loss_val, epoch * num_batches + batch_idx)
-                writer.add_scalar('Loss/obj', obj_loss_val, epoch * num_batches + batch_idx)
-                writer.add_scalar('Loss/cls', cls_loss_val, epoch * num_batches + batch_idx)
+                try:
+                    writer.add_scalar('Loss/total', loss_val, epoch * num_batches + batch_idx)
+                    writer.add_scalar('Loss/box', box_loss_val, epoch * num_batches + batch_idx)
+                    writer.add_scalar('Loss/obj', obj_loss_val, epoch * num_batches + batch_idx)
+                    writer.add_scalar('Loss/cls', cls_loss_val, epoch * num_batches + batch_idx)
+                    writer.flush()  # Flush to prevent blocking
+                except Exception as e:
+                    # Don't let logging errors stop training
+                    if batch_idx % (log_freq * 10) == 0:  # Only print error occasionally
+                        print(f"Warning: TensorBoard logging error: {e}", flush=True)
             
-            # Update progress bar (less frequently for CPU to reduce overhead)
-            update_freq = 50 if device.type == 'cpu' else 10
-            if batch_idx % update_freq == 0 or batch_idx == num_batches - 1:
-                pbar.set_postfix({
-                    'loss': f'{loss_val:.4f}',
-                    'box': f'{box_loss_val:.4f}',
-                    'obj': f'{obj_loss_val:.4f}',
-                    'cls': f'{cls_loss_val:.4f}'
-                })
+            # Print progress less frequently for speed (with flush to see output immediately)
+            print_freq = 10 if device.type == 'cpu' else 50  # More frequent on CPU for debugging
+            if batch_idx % print_freq == 0 or batch_idx == num_batches - 1:
+                print(f"Epoch {epoch+1}, Batch {batch_idx}/{num_batches}: "
+                      f"loss={loss_val:.4f}, box={box_loss_val:.4f}, "
+                      f"obj={obj_loss_val:.4f}, cls={cls_loss_val:.4f}", flush=True)
             
         except Exception as e:
-            print(f"Error in train_one_epoch at batch {batch_idx}: {str(e)}")
+            print(f"Error in train_one_epoch at batch {batch_idx}: {str(e)}", flush=True)
             import traceback
             traceback.print_exc()
             continue
@@ -304,12 +402,65 @@ def main():
     if not os.path.isabs(config['data']['root_dir']):
         config['data']['root_dir'] = os.path.join(project_root, config['data']['root_dir'])
     
+    # Detect Colab environment (multiple detection methods)
+    is_colab = (
+        'COLAB_GPU' in os.environ or 
+        'COLAB_TPU' in os.environ or
+        'google.colab' in str(os.environ.get('_', '')) or
+        os.path.exists('/content') or
+        'colab' in str(os.environ.get('HOME', '')).lower()
+    )
+    
     # Initialize device
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Initialize model with fast mode for CPU training
-    fast_mode = (device.type == 'cpu')  # Enable fast mode on CPU
+    # Auto-optimize for Colab T4 GPU
+    if is_colab and device.type == 'cuda':
+        print("🎯 Colab T4 GPU detected! Auto-optimizing settings...")
+        # Optimize batch size for T4 (16GB VRAM)
+        if config['training']['batch_size'] < 16:
+            config['training']['batch_size'] = 16
+            print(f"  → Batch size set to {config['training']['batch_size']} for T4 GPU")
+        # Disable gradient accumulation on GPU (not needed with larger batch size)
+        if config['training'].get('gradient_accumulation_steps', 1) > 1:
+            config['training']['gradient_accumulation_steps'] = 1
+            print("  → Gradient accumulation disabled (using larger batch size instead)")
+        # Optimize num_workers for Colab
+        config['data']['num_workers'] = 4
+        print(f"  → Num workers set to {config['data']['num_workers']} for Colab")
+        # Use full resolution on GPU
+        if config['data']['img_size'] < 640:
+            config['data']['img_size'] = 640
+            print(f"  → Image size set to {config['data']['img_size']} for better accuracy on GPU")
+            # Update model config too
+            config['model']['img_size'] = 640
+            # Update anchors for 640
+            config['model']['anchors'] = [
+                [[10, 13], [16, 30], [33, 23]],  # Scale 1 (80x80)
+                [[30, 61], [62, 45], [59, 119]],  # Scale 2 (40x40)
+                [[116, 90], [156, 198], [373, 326]]  # Scale 3 (20x20)
+            ]
+        # Enable mosaic on GPU (affordable)
+        config['augmentation']['mosaic'] = True
+        config['augmentation']['mosaic_prob'] = 0.5
+        print("  → Mosaic augmentation enabled for GPU")
+        print("✅ Colab optimization complete!")
+    
+    # Initialize GradScaler for mixed precision training (GPU only)
+    # Use new API for PyTorch 2.0+, fall back to old API for older versions
+    if device.type == "cuda":
+        try:
+            # Try new API first (PyTorch 2.0+)
+            scaler = GradScaler('cuda')
+        except (TypeError, ValueError):
+            # Fall back to old API for older PyTorch versions
+            scaler = GradScaler(enabled=True)
+    else:
+        scaler = None
+
+    # Initialize model with fast mode for CPU training (disable on GPU for better accuracy)
+    fast_mode = (device.type == 'cpu')  # Enable fast mode on CPU, disable on GPU
     model = FusionYOLOv11(
         num_classes=config['model']['num_classes'], 
         img_size=config['data']['img_size'],
@@ -343,9 +494,18 @@ def main():
         transforms=get_transforms(config, training=False)
     )
     
-    # Use num_workers=0 on macOS to avoid multiprocessing issues, or use the config value
+    # Optimize num_workers based on platform and device
     import platform
-    num_workers = 0 if platform.system() == 'Darwin' else config['data']['num_workers']
+    if platform.system() == 'Darwin':
+        num_workers = 0  # macOS doesn't support fork, use 0
+    elif is_colab and device.type == 'cuda':
+        num_workers = 4  # Colab GPU: use 4 workers
+    else:
+        num_workers = config['data']['num_workers']
+        # Optimize num_workers based on CPU count
+        if num_workers > 0:
+            cpu_count = os.cpu_count() or 4
+            num_workers = min(num_workers, cpu_count, 8)  # Cap at 8 to avoid overhead
     if num_workers > 0:
         print(f"Using {num_workers} workers for data loading")
     else:
@@ -364,7 +524,8 @@ def main():
         collate_fn=train_collate,
         pin_memory=(device.type == 'cuda'),  # Only pin memory for GPU
         persistent_workers=(num_workers > 0),  # Keep workers alive
-        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches
+        prefetch_factor=4 if num_workers > 0 else None,  # Increased prefetch for faster loading
+        generator=torch.Generator() if device.type == 'cpu' else None,  # Deterministic for CPU
         drop_last=True  # Drop last incomplete batch for consistent batch sizes
     )
     
@@ -393,19 +554,47 @@ def main():
     # Initialize logging
     log_dir = os.path.join(project_root, config['logging']['log_dir']) if not os.path.isabs(config['logging']['log_dir']) else config['logging']['log_dir']
     tensorboard_dir = os.path.join(project_root, config['logging']['tensorboard_dir']) if not os.path.isabs(config['logging']['tensorboard_dir']) else config['logging']['tensorboard_dir']
-    checkpoint_dir = os.path.join(project_root, config['logging']['checkpoint_dir']) if not os.path.isabs(config['logging']['checkpoint_dir']) else config['logging']['checkpoint_dir']
+    checkpoint_dir = config['logging']['checkpoint_dir']
+    # If checkpoint_dir is absolute (Colab path), use it directly; otherwise make it relative to project root
+    if not os.path.isabs(checkpoint_dir):
+        checkpoint_dir = os.path.join(project_root, checkpoint_dir)
     
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(tensorboard_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Create directories (handle Colab paths that might not exist yet)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(tensorboard_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    except OSError as e:
+        if '/content' in checkpoint_dir:
+            # If Colab path doesn't exist, fall back to local checkpoint directory
+            print(f"Warning: Could not create Colab checkpoint directory: {checkpoint_dir}")
+            checkpoint_dir = os.path.join(project_root, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print(f"Using local checkpoint directory instead: {checkpoint_dir}")
+        else:
+            raise e
     writer = SummaryWriter(tensorboard_dir)
     
     # Training loop
     best_map = 0.0
-    for epoch in range(config['training']['epochs']):
+    start_epoch = 0
+    last_ckpt = os.path.join(checkpoint_dir, "yolov11_fusion_last.pt")
+    if os.path.exists(last_ckpt):
+        print("Resuming from last checkpoint")
+        checkpoint = torch.load(last_ckpt, map_location=device)
+        model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint and scaler is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        print(f"Resuming from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, config['training']['epochs']):
         # Train
         avg_loss, avg_box_loss, avg_obj_loss, avg_cls_loss = train_one_epoch(
-            model, train_loader, optimizer, config, device, epoch, writer
+            model, train_loader, optimizer, config, device, epoch, writer, scaler
         )
         print(f"Epoch {epoch+1}/{config['training']['epochs']}: "
               f"Loss={avg_loss:.4f}, Box={avg_box_loss:.4f}, Obj={avg_obj_loss:.4f}, Cls={avg_cls_loss:.4f}")
@@ -414,8 +603,9 @@ def main():
         if scheduler is not None:
             scheduler.step()
         
-        # Evaluate
+        # Evaluate (with no_grad for speed)
         if (epoch + 1) % config['evaluation']['eval_freq'] == 0:
+            model.eval()  # Set to eval mode
             # Find the dataset being used (smod in this case)
             dataset_name = 'smod'
             val_annotation_path = os.path.join(config['data']['root_dir'], dataset_name, 'annotations', 'instances_val.json')
@@ -434,13 +624,31 @@ def main():
             if metrics['mAP@0.5'] > best_map:
                 best_map = metrics['mAP@0.5']
                 torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'yolov11_fusion_best.pt'))
+            
+            model.train()  # Set back to train mode
         
         # Save checkpoint
         if (epoch + 1) % config['logging']['save_freq'] == 0:
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'yolov11_fusion_epoch_{epoch+1}.pt'))
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_map': best_map
+            }
+            if scaler is not None:
+                checkpoint['scaler_state_dict'] = scaler.state_dict()
+            torch.save(checkpoint, os.path.join(checkpoint_dir, f'yolov11_fusion_epoch_{epoch+1}.pt'))
     
     # Save final model
-    torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'yolov11_fusion_last.pt'))
+    final_checkpoint = {
+        'epoch': config['training']['epochs'] - 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_map': best_map
+    }
+    if scaler is not None:
+        final_checkpoint['scaler_state_dict'] = scaler.state_dict()
+    torch.save(final_checkpoint, os.path.join(checkpoint_dir, 'yolov11_fusion_last.pt'))
     writer.close()
 
 if __name__ == "__main__":

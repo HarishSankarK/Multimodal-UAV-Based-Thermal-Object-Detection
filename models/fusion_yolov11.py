@@ -17,19 +17,21 @@ class AttentionGating(nn.Module):
     def __init__(self, channels):
         super(AttentionGating, self).__init__()
         # Compute attention weights from both modalities
+        # Input: concatenated RGB+IR features (channels * 2)
+        # Output: attention weights for fused features (channels)
         self.attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(channels * 2, channels, 1),
             nn.Sigmoid()
         )
     
-    def forward(self, rgb_feat, ir_feat, fused_feat):
+    def forward(self, rgb_feat, ir_feat):
         # Concatenate RGB and IR for attention computation
-        concat_feat = torch.cat([rgb_feat, ir_feat], dim=1)
+        concat_feat = torch.cat([rgb_feat, ir_feat], dim=1)  # [B, C*2, H, W]
         # Generate attention weights
-        attention_weights = self.attention(concat_feat)
-        # Apply attention to fused features
-        return attention_weights * fused_feat
+        attention_weights = self.attention(concat_feat)  # [B, C, 1, 1]
+        # Return attention weights (will be applied to fused features in forward)
+        return attention_weights
 
 class FusionYOLOv11(nn.Module):
     """Multimodal YOLOv11 with mid-fusion for RGB and IR inputs.
@@ -67,11 +69,12 @@ class FusionYOLOv11(nn.Module):
         for i, (rgb_feat, ir_feat) in enumerate(zip(rgb_features, ir_features if ir is not None else [None] * 3)):
             if ir_feat is not None:
                 # Step 1: Concatenate features
-                fused = torch.cat([rgb_feat, ir_feat], dim=1)
+                fused = torch.cat([rgb_feat, ir_feat], dim=1)  # [B, C*2, H, W]
                 # Step 2: Reduce channels
-                fused = self.fusion_layers[i](fused)
-                # Step 3: Apply attention gating (per paper)
-                fused = self.attention_gates[i](rgb_feat, ir_feat, fused)
+                fused = self.fusion_layers[i](fused)  # [B, C, H, W]
+                # Step 3: Apply attention gating (per paper): F'fused = G(FRGB, FIR) ⊗ Ffused
+                attention_weights = self.attention_gates[i](rgb_feat, ir_feat)  # [B, C, 1, 1]
+                fused = attention_weights * fused  # Element-wise multiplication
             else:
                 fused = rgb_feat  # Use RGB only if IR is absent
             fused_features.append(fused)

@@ -151,8 +151,13 @@ def apply_mosaic(images, images_ir, bboxes, labels, img_size=640):
 
 class TransformFunction:
     """Pickleable transform class for multiprocessing compatibility."""
-    def __init__(self, img_size, training=True):
-        self.img_size = img_size
+    def __init__(self, config, training=True):
+        """
+        Args:
+            config (dict): Configuration dictionary with 'data' key containing 'img_size'.
+            training (bool): Whether to apply training augmentations.
+        """
+        self.img_size = config['data']['img_size']
         self.training = training
     
     def __call__(self, image=None, image_ir=None, bboxes=None, labels=None):
@@ -215,7 +220,7 @@ def get_transforms(config, training=True):
     Returns:
         callable: Transform function compatible with albumentations-style calls.
     """
-    return TransformFunction(config['data']['img_size'], training=training)
+    return TransformFunction(config, training=training)
 
 def rotate_boxes(boxes, angle, cx, cy):
     """

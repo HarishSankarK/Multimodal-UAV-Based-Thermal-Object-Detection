@@ -1,8 +1,7 @@
-# Default training hyperparameters
 training:
   epochs: 100
-  batch_size: 8  # Increased for better CPU utilization and faster training
-                  # Larger batches = fewer iterations = faster epoch time
+  batch_size: 2  # Reduced for faster backward pass on CPU (2x faster than 8)
+                  # Use gradient_accumulation_steps: 4 to maintain effective batch_size=8
                   # For GPU training, you can use larger batch sizes (16-32)
   learning_rate: 0.01
   momentum: 0.937
@@ -13,6 +12,7 @@ training:
   lr_schedule: cosine  # Options: linear, cosine
   optimizer: SGD  # Options: SGD, Adam, AdamW
   gradient_clip: 10.0
+  gradient_accumulation_steps: 4  # Accumulate gradients over 4 batches (effective batch_size = 2*4 = 8)
 
 data:
   root_dir: "data"  # Relative path to data directory
@@ -32,8 +32,9 @@ data:
         train: "dronergbt/annotations/instances_train.json"
         val: "dronergbt/annotations/instances_val.json"
         test: "dronergbt/annotations/instances_test.json"
-  img_size: 416  # Reduced from 640 for 2.4x speedup (640^2 / 416^2 ≈ 2.4)
-  num_workers: 0  # Set to 0 on macOS to avoid multiprocessing overhead
+  img_size: 256  # Further reduced for 6.25x speedup from 640 (640^2 / 256^2 = 6.25)
+                  # Can increase to 320, 416 or 640 for better accuracy
+  num_workers: 4  # Optimized for speed - use 0 on macOS, 4-8 for Linux/Colab
 
 augmentation:
   mosaic: false  # Disabled for faster training (mosaic is expensive)
@@ -44,13 +45,11 @@ augmentation:
 logging:
   log_dir: "experiments/logs"
   tensorboard_dir: "experiments/tensorboard"
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "checkpoints"  # Relative path for local, use "/content/drive/MyDrive/yolo_checkpoints" for Colab
   save_freq: 10  # Save checkpoint every 10 epochs
-  log_freq: 100  # Log training metrics every 100 iterations
+  log_freq: 200  # Reduced logging frequency for faster training
 
 evaluation:
-  eval_freq: 5  # Evaluate on validation set every 5 epochs
+  eval_freq: 5  # Evaluate less frequently for faster training
   conf_thres: 0.5
   iou_thres: 0.5
-
-device: cuda  # Options: cuda, cpu

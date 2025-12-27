@@ -35,7 +35,20 @@ def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, 
             # Decode box coordinates
             xy = (torch.sigmoid(pred[:, :2]) + torch.stack([grid_x, grid_y], dim=-1)) * strides[i]
             # Convert anchors to tensor if needed
-            anchor_tensor = torch.tensor(anchors[i], device=pred.device, dtype=torch.float32)
+            anchor_array = anchors[i]
+            if isinstance(anchor_array, (list, tuple)):
+                anchor_array = np.array(anchor_array, dtype=np.float32)
+            if isinstance(anchor_array, np.ndarray):
+                anchor_tensor = torch.from_numpy(anchor_array).to(pred.device)
+            else:
+                anchor_tensor = anchor_array.to(pred.device) if hasattr(anchor_array, 'to') else torch.tensor(anchor_array, device=pred.device, dtype=torch.float32)
+            # Reshape anchors to [num_anchors, 2] for broadcasting
+            if anchor_tensor.ndim == 1:
+                anchor_tensor = anchor_tensor.view(-1, 2)
+            elif anchor_tensor.ndim == 2 and anchor_tensor.shape[1] != 2:
+                anchor_tensor = anchor_tensor.view(-1, 2)
+            # Expand anchors to match pred shape: [num_anchors*H*W, 2]
+            anchor_tensor = anchor_tensor.repeat(h * w, 1)  # [num_anchors*H*W, 2]
             wh = torch.exp(pred[:, 2:4]) * anchor_tensor
             boxes = torch.cat([xy - wh / 2, xy + wh / 2], dim=-1)  # [x_min, y_min, x_max, y_max]
             

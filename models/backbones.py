@@ -80,7 +80,8 @@ class SGGFNet(nn.Module):
         self.fast_mode = fast_mode
         self.stem = ConvBlock(in_channels, 64, 6, stride=2, padding=2)
         # Reduced bottlenecks for faster training: 3 -> 1, 9 -> 3, 9 -> 3, 3 -> 1
-        bottleneck_counts = (1, 3, 3, 1) if fast_mode else (3, 9, 9, 3)
+        # Even more aggressive for CPU: 1, 1, 1, 1 (minimal bottlenecks)
+        bottleneck_counts = (1, 1, 1, 1) if fast_mode else (3, 9, 9, 3)
         self.stage1 = CSPBlock(64, 128, bottleneck_counts[0])
         self.stage2 = nn.Sequential(
             ConvBlock(128, 256, 3, stride=2, padding=1),
@@ -114,7 +115,7 @@ class DualBackbone(nn.Module):
         self.ir_backbone = SGGFNet(in_channels=3, fast_mode=fast_mode)  # IR converted to 3 channels in dataset
 
     def forward(self, rgb, ir=None):
-        rgb_features = self.rgb_backbone(rgb)  # (s2, s3, s4)
+        rgb_features = self.rgb_backbone(rgb)  # Returns (s4, s3, s2) - deepest to shallowest
         ir_features = self.ir_backbone(ir) if ir is not None else None
         return rgb_features, ir_features
 

@@ -31,16 +31,45 @@ def collate_fn(batch, mosaic_prob=0.5, img_size=640):
     if random.random() < mosaic_prob and len(batch) >= 4:
         # Select 4 samples for mosaic
         indices = random.sample(range(len(batch)), 4)
+        
+        # Prepare RGB images for mosaic
+        mosaic_rgb_inputs = []
+        for i in indices:
+            rgb_tensor = rgb_images[i]
+            if isinstance(rgb_tensor, torch.Tensor):
+                rgb_np = (rgb_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            else:
+                rgb_np = rgb_tensor
+            mosaic_rgb_inputs.append(rgb_np)
+        
+        # Prepare IR images for mosaic (handle None values)
+        mosaic_ir_inputs = []
+        has_ir = any(ir_images[i] is not None for i in indices)
+        for i in indices:
+            if ir_images[i] is not None:
+                ir_tensor = ir_images[i]
+                if isinstance(ir_tensor, torch.Tensor):
+                    ir_np = (ir_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                else:
+                    ir_np = ir_tensor
+                mosaic_ir_inputs.append(ir_np)
+            else:
+                mosaic_ir_inputs.append(None)
+        
+        # Prepare boxes and labels
+        mosaic_bboxes_inputs = [boxes_list[i].numpy() if isinstance(boxes_list[i], torch.Tensor) else boxes_list[i] for i in indices]
+        mosaic_labels_inputs = [labels_list[i].numpy() if isinstance(labels_list[i], torch.Tensor) else labels_list[i] for i in indices]
+        
         mosaic_rgb, mosaic_ir, mosaic_boxes, mosaic_labels = apply_mosaic(
-            [(rgb_images[i].permute(1, 2, 0).numpy() * 255).astype(np.uint8) for i in indices],
-            [ir_images[i].permute(1, 2, 0).numpy() * 255 if ir_images[i] is not None else None for i in indices],
-            [boxes_list[i].numpy() for i in indices],
-            [labels_list[i].numpy() for i in indices],
+            mosaic_rgb_inputs,
+            mosaic_ir_inputs if has_ir else [None] * 4,
+            mosaic_bboxes_inputs,
+            mosaic_labels_inputs,
             img_size=img_size
         )
         # Replace one sample with mosaic
-        rgb_images[0] = torch.from_numpy(mosaic_rgb).permute(2, 0, 1).float()
-        ir_images[0] = torch.from_numpy(mosaic_ir).permute(2, 0, 1).float() if mosaic_ir is not None else None
+        rgb_images[0] = torch.from_numpy(mosaic_rgb).permute(2, 0, 1).float() / 255.0
+        ir_images[0] = torch.from_numpy(mosaic_ir).permute(2, 0, 1).float() / 255.0 if mosaic_ir is not None else None
         boxes_list[0] = torch.from_numpy(mosaic_boxes).float()
         labels_list[0] = torch.from_numpy(mosaic_labels).long()
         image_ids[0] = -1  # Mosaic image doesn't correspond to a single ID
@@ -65,31 +94,44 @@ def collate_fn(batch, mosaic_prob=0.5, img_size=640):
         ir_images = None
 
     # Pad boxes and labels
-    max_num_boxes = max(len(boxes) for boxes in boxes_list)
-    padded_boxes = []
-    padded_labels = []
-    for boxes, labels in zip(boxes_list, labels_list):
-        num_boxes = len(boxes)
-        if num_boxes > 0:
-            padded_boxes.append(torch.cat([
-                boxes,
-                torch.zeros((max_num_boxes - num_boxes, 4), dtype=torch.float32)
-            ], dim=0))
-            padded_labels.append(torch.cat([
-                labels,
-                torch.zeros(max_num_boxes - num_boxes, dtype=torch.int64)
-            ], dim=0))
-        else:
-            padded_boxes.append(torch.zeros((max_num_boxes, 4), dtype=torch.float32))
-            padded_labels.append(torch.zeros(max_num_boxes, dtype=torch.int64))
+    max_num_boxes = max(len(boxes) for boxes in boxes_list) if boxes_list else 0
+    
+    if max_num_boxes == 0:
+        # Handle case where no boxes in batch
+        padded_boxes = torch.zeros((len(batch), 0, 4), dtype=torch.float32)
+        padded_labels = torch.zeros((len(batch), 0), dtype=torch.int64)
+        box_mask = torch.zeros((len(batch), 0), dtype=torch.bool)
+    else:
+        padded_boxes = []
+        padded_labels = []
+        for boxes, labels in zip(boxes_list, labels_list):
+            num_boxes = len(boxes)
+            if num_boxes > 0:
+                # Convert to tensor if needed
+                if isinstance(boxes, np.ndarray):
+                    boxes = torch.from_numpy(boxes).float()
+                if isinstance(labels, np.ndarray):
+                    labels = torch.from_numpy(labels).long()
+                padded_boxes.append(torch.cat([
+                    boxes,
+                    torch.zeros((max_num_boxes - num_boxes, 4), dtype=torch.float32)
+                ], dim=0))
+                padded_labels.append(torch.cat([
+                    labels,
+                    torch.full((max_num_boxes - num_boxes,), -1, dtype=torch.int64)  # Use -1 for padding
+                ], dim=0))
+            else:
+                padded_boxes.append(torch.zeros((max_num_boxes, 4), dtype=torch.float32))
+                padded_labels.append(torch.full((max_num_boxes,), -1, dtype=torch.int64))  # Use -1 for padding
 
-    padded_boxes = torch.stack(padded_boxes, dim=0)
-    padded_labels = torch.stack(padded_labels, dim=0)
+        padded_boxes = torch.stack(padded_boxes, dim=0)
+        padded_labels = torch.stack(padded_labels, dim=0)
 
-    # Create mask for valid boxes
-    box_mask = torch.zeros((len(batch), max_num_boxes), dtype=torch.bool)
-    for i, boxes in enumerate(boxes_list):
-        box_mask[i, :len(boxes)] = 1
+        # Create mask for valid boxes
+        box_mask = torch.zeros((len(batch), max_num_boxes), dtype=torch.bool)
+        for i, boxes in enumerate(boxes_list):
+            if len(boxes) > 0:
+                box_mask[i, :len(boxes)] = True
 
     return {
         'image_rgb': rgb_images,
