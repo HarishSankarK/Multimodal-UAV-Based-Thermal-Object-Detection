@@ -5,7 +5,7 @@ import os
 import matplotlib.pyplot as plt
 import torchvision
 
-def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, conf_thres=0.5, iou_thres=0.5):
+def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, conf_thres=0.01, iou_thres=0.5):
     """
     Decode YOLOv11 predictions to bounding boxes.
     Args:
@@ -27,13 +27,19 @@ def decode_predictions(predictions, anchors, strides=[8, 16, 32], img_size=640, 
             num_anchors, h, w = pred.shape[1:4]
             pred = pred[batch_idx].view(num_anchors * h * w, -1)  # [num_anchors * H * W, 5 + num_classes]
             
-            # Generate grid
-            grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-            grid_x = grid_x.reshape(-1).to(pred.device)
-            grid_y = grid_y.reshape(-1).to(pred.device)
-            
+            grid_y, grid_x = torch.meshgrid(
+              torch.arange(h, device=pred.device),
+              torch.arange(w, device=pred.device),
+              indexing='ij'
+            )
+
+            grid = torch.stack([grid_x, grid_y], dim=-1)  # [H, W, 2]
+            grid = grid.view(1, h * w, 2)                # [1, HW, 2]
+            grid = grid.repeat(num_anchors, 1, 1)        # [A, HW, 2]
+            grid = grid.view(num_anchors * h * w, 2)     # [A*HW, 2]
+
             # Decode box coordinates
-            xy = (torch.sigmoid(pred[:, :2]) + torch.stack([grid_x, grid_y], dim=-1)) * strides[i]
+            xy = (torch.sigmoid(pred[:, :2]) + grid) * strides[i]
             # Convert anchors to tensor if needed
             anchor_array = anchors[i]
             if isinstance(anchor_array, (list, tuple)):
@@ -104,7 +110,7 @@ def draw_boxes(image, boxes, labels=None, class_names=['person', 'rider', 'bicyc
         cv2.putText(img, label, (int(x_min), int(y_min) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return img
 
-def visualize_detections(rgb_image, ir_image, predictions, anchors, output_dir="visualizations", img_id=0):
+def visualize_detections(rgb_image, ir_image, predictions, anchors, img_size, conf_thres, iou_thres, output_dir="visualizations", img_id=0):
     """
     Visualize predictions on RGB and IR images.
     Args:
@@ -115,10 +121,19 @@ def visualize_detections(rgb_image, ir_image, predictions, anchors, output_dir="
         output_dir (str): Directory to save visualizations.
         img_id (int): Image ID for naming.
     """
+
     os.makedirs(output_dir, exist_ok=True)
     
     # Decode predictions
-    detections = decode_predictions(predictions, anchors)
+    detections = decode_predictions(
+      predictions,
+      anchors,
+      strides=[8,16,32],
+      img_size=img_size,
+      conf_thres=conf_thres,
+      iou_thres=iou_thres
+    )
+
     
     # Convert images to numpy
     rgb_img = (rgb_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -143,8 +158,7 @@ def visualize_heatmap(image, predictions, output_dir="visualizations", img_id=0)
         output_dir (str): Directory to save heatmap.
         img_id (int): Image ID for naming.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    
+        
     # Aggregate objectness scores across scales
     heatmap = torch.zeros((image.shape[1], image.shape[2]))
     for pred, stride in zip(predictions, [8, 16, 32]):

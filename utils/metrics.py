@@ -27,7 +27,7 @@ def compute_iou(boxes1, boxes2):
     union = area1[:, None] + area2 - inter
     return inter / (union + 1e-6)
 
-def evaluate_coco(model, dataloader, annotation_file, anchors, device='cuda'):
+def evaluate_coco(model, dataloader, annotation_file, anchors, img_size, conf_thres, iou_thres, device='cuda'):
     """
     Evaluate model on a dataset using COCO mAP metrics.
     Args:
@@ -52,7 +52,15 @@ def evaluate_coco(model, dataloader, annotation_file, anchors, device='cuda'):
         with torch.no_grad():
             predictions = model(rgb, ir)
         
-        detections = decode_predictions(predictions, anchors, conf_thres=0.5, iou_thres=0.5)
+        detections = detections = decode_predictions(
+          predictions,
+          anchors,
+          strides=[8,16,32],
+          img_size=img_size,
+          conf_thres=conf_thres,
+          iou_thres=iou_thres
+        )
+
         
         for img_id, dets in zip(image_ids, detections):
             if dets.shape[0] > 0:  # Check if there are any detections
@@ -65,7 +73,14 @@ def evaluate_coco(model, dataloader, annotation_file, anchors, device='cuda'):
                         'bbox': [float(x_min), float(y_min), float(x_max - x_min), float(y_max - y_min)],
                         'score': float(conf)
                     })
-    
+    # 🚨 SAFETY CHECK: no detections
+    if len(coco_dt) == 0:
+      print("⚠️ No detections produced for this epoch. Skipping COCO evaluation.")
+      return {
+        'mAP@0.5': 0.0,
+        'mAP@0.5:0.95': 0.0
+      }
+
     # Load detections into COCO format
     coco_dt = coco.loadRes(coco_dt)
     coco_eval = COCOeval(coco, coco_dt, 'bbox')
