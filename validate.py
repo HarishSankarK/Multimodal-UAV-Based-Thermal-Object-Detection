@@ -62,6 +62,9 @@ def main():
         val_loader,
         val_annotation_path,
         config['model']['anchors'],
+        config['data']['img_size'],
+        config['evaluation']['conf_thres'],
+        config['evaluation']['iou_thres'],
         device
     )
     

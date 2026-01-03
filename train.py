@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch.nn as nn
 import torch
 import numpy as np
@@ -13,7 +14,7 @@ from datasets.collate import collate_fn
 from datasets.transforms import get_transforms
 from models.fusion_yolov11 import FusionYOLOv11
 from utils.metrics import evaluate_coco
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 def bbox_ciou(box1, box2, eps=1e-7):
     # box format: [x1,y1,x2,y2]
@@ -250,7 +251,7 @@ def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer,
             # Forward pass with mixed precision (GPU only)
             if scaler is not None and device.type == 'cuda':
                 # Mixed precision training for GPU (1.5-2x speedup)
-                with autocast():
+                with autocast('cuda'):
                     predictions = model(rgb, ir)
                     box_loss, obj_loss, cls_loss = compute_yolo_loss(
                         predictions,
@@ -268,13 +269,16 @@ def train_one_epoch(model, dataloader, optimizer, config, device, epoch, writer,
                 # Backward pass with mixed precision
                 loss_scaled = loss / grad_accum_steps  # Scale for gradient accumulation
                 scaler.scale(loss_scaled).backward()
-                scaler.unscale_(optimizer)  # Unscale before clipping
-                
-                # Only update weights every N batches (gradient accumulation)
+
+                # ONLY unscale + clip + step when updating optimizer
                 if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
-                    scaler.step(optimizer)
-                    scaler.update()
+                  scaler.unscale_(optimizer)  # ✅ moved INSIDE
+                  torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config['training']['gradient_clip']
+                  )
+                  scaler.step(optimizer)
+                  scaler.update()
             else:
                 # Standard precision for CPU
                 predictions = model(rgb, ir)
@@ -412,40 +416,44 @@ def main():
     )
     
     # Initialize device
-    device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
+    device_name = config.get('device', 'cuda')
+    device = torch.device(device_name if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Auto-optimize for Colab T4 GPU
     if is_colab and device.type == 'cuda':
         print("🎯 Colab T4 GPU detected! Auto-optimizing settings...")
-        # Optimize batch size for T4 (16GB VRAM)
-        if config['training']['batch_size'] < 16:
-            config['training']['batch_size'] = 16
-            print(f"  → Batch size set to {config['training']['batch_size']} for T4 GPU")
-        # Disable gradient accumulation on GPU (not needed with larger batch size)
-        if config['training'].get('gradient_accumulation_steps', 1) > 1:
-            config['training']['gradient_accumulation_steps'] = 1
-            print("  → Gradient accumulation disabled (using larger batch size instead)")
+        # Clear GPU cache first to avoid OOM from previous runs
+        torch.cuda.empty_cache()
+        # Optimize batch size for T4 (16GB VRAM) - use 8 with gradient accumulation
+        # This gives effective batch size of 16 while keeping memory usage low
+        config['training']['batch_size'] = 8
+        print(f"  → Batch size set to {config['training']['batch_size']} for T4 GPU")
+        # Use gradient accumulation for effective batch size (8 * 2 = 16 effective)
+        config['training']['gradient_accumulation_steps'] = 2
+        print(f"  → Gradient accumulation set to {config['training']['gradient_accumulation_steps']} (effective batch size: {config['training']['batch_size'] * config['training']['gradient_accumulation_steps']})")
         # Optimize num_workers for Colab
         config['data']['num_workers'] = 4
         print(f"  → Num workers set to {config['data']['num_workers']} for Colab")
         # Use full resolution on GPU
-        if config['data']['img_size'] < 640:
-            config['data']['img_size'] = 640
-            print(f"  → Image size set to {config['data']['img_size']} for better accuracy on GPU")
-            # Update model config too
-            config['model']['img_size'] = 640
-            # Update anchors for 640
-            config['model']['anchors'] = [
-                [[10, 13], [16, 30], [33, 23]],  # Scale 1 (80x80)
-                [[30, 61], [62, 45], [59, 119]],  # Scale 2 (40x40)
-                [[116, 90], [156, 198], [373, 326]]  # Scale 3 (20x20)
-            ]
-        # Enable mosaic on GPU (affordable)
-        config['augmentation']['mosaic'] = True
-        config['augmentation']['mosaic_prob'] = 0.5
-        print("  → Mosaic augmentation enabled for GPU")
+        print(f"Using image size from config: {config['data']['img_size']}")
+        config['model']['img_size'] = config['data']['img_size']
+
+        print("Using mosaic setting from config:", config['augmentation']['mosaic'])
+
         print("✅ Colab optimization complete!")
+    elif not is_colab:
+        # Optimize for local system (CPU or GPU) - use same batch size as Colab for consistency
+        print("💻 Local system detected. Optimizing settings...")
+        # Use batch size 8 to match Colab (gives 600 batches for 4800 samples)
+        if config['training']['batch_size'] < 8:
+            config['training']['batch_size'] = 8
+            print(f"  → Batch size set to {config['training']['batch_size']} for consistency with Colab (600 batches per epoch)")
+        # Use gradient accumulation for effective batch size
+        if 'gradient_accumulation_steps' not in config['training']:
+            config['training']['gradient_accumulation_steps'] = 2
+        print(f"  → Gradient accumulation set to {config['training']['gradient_accumulation_steps']} (effective batch size: {config['training']['batch_size'] * config['training']['gradient_accumulation_steps']})")
+        print("✅ Local system optimization complete!")
     
     # Initialize GradScaler for mixed precision training (GPU only)
     # Use new API for PyTorch 2.0+, fall back to old API for older versions
@@ -468,17 +476,19 @@ def main():
     )
     model.to(device)
     
-    # Compile model for faster execution (PyTorch 2.0+)
+    # Load pretrained weights BEFORE compiling (if any)
+    if config['paths']['pretrained_weights']:
+        model.load_state_dict(torch.load(config['paths']['pretrained_weights'], map_location=device))
+    
+    # Compile model for faster execution (PyTorch 2.0+) - ONLY for CPU
+    # NOTE: Do NOT compile on GPU to avoid CUDA graph issues with gradient accumulation
     try:
-        if hasattr(torch, 'compile'):
+        if hasattr(torch, 'compile') and device.type == 'cpu':
             print("Compiling model with torch.compile for faster execution...")
             model = torch.compile(model, mode='reduce-overhead')
             print("Model compiled successfully!")
     except Exception as e:
         print(f"Could not compile model (this is OK): {e}")
-    
-    if config['paths']['pretrained_weights']:
-        model.load_state_dict(torch.load(config['paths']['pretrained_weights'], map_location=device))
     
     # Initialize datasets and dataloaders
     train_dataset = MultimodalDataset(
@@ -516,15 +526,21 @@ def main():
     train_collate = partial(collate_fn, mosaic_prob=config['augmentation']['mosaic_prob'], img_size=config['data']['img_size'])
     val_collate = partial(collate_fn, mosaic_prob=0.0, img_size=config['data']['img_size'])
     
+    # Print actual batch size being used
+    actual_batch_size = config['training']['batch_size']
+    print(f"Using batch size: {actual_batch_size}")
+    print(f"Dataset size: {len(train_dataset)} samples")
+    print(f"Expected batches per epoch: {len(train_dataset) // actual_batch_size}")
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=actual_batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=train_collate,
         pin_memory=(device.type == 'cuda'),  # Only pin memory for GPU
         persistent_workers=(num_workers > 0),  # Keep workers alive
-        prefetch_factor=4 if num_workers > 0 else None,  # Increased prefetch for faster loading
+        prefetch_factor=2 if num_workers > 0 else None,  # Reduced prefetch to save memory
         generator=torch.Generator() if device.type == 'cpu' else None,  # Deterministic for CPU
         drop_last=True  # Drop last incomplete batch for consistent batch sizes
     )
@@ -554,25 +570,45 @@ def main():
     # Initialize logging
     log_dir = os.path.join(project_root, config['logging']['log_dir']) if not os.path.isabs(config['logging']['log_dir']) else config['logging']['log_dir']
     tensorboard_dir = os.path.join(project_root, config['logging']['tensorboard_dir']) if not os.path.isabs(config['logging']['tensorboard_dir']) else config['logging']['tensorboard_dir']
-    checkpoint_dir = config['logging']['checkpoint_dir']
-    # If checkpoint_dir is absolute (Colab path), use it directly; otherwise make it relative to project root
-    if not os.path.isabs(checkpoint_dir):
-        checkpoint_dir = os.path.join(project_root, checkpoint_dir)
     
-    # Create directories (handle Colab paths that might not exist yet)
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(tensorboard_dir, exist_ok=True)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-    except OSError as e:
-        if '/content' in checkpoint_dir:
-            # If Colab path doesn't exist, fall back to local checkpoint directory
-            print(f"Warning: Could not create Colab checkpoint directory: {checkpoint_dir}")
-            checkpoint_dir = os.path.join(project_root, "checkpoints")
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            print(f"Using local checkpoint directory instead: {checkpoint_dir}")
+    # Auto-detect environment and set checkpoint directory accordingly
+    checkpoint_dir = config['logging']['checkpoint_dir']
+    
+    # Check if running on Colab (Google Drive path)
+    if is_colab:
+        # Try to use Google Drive path if available
+        if checkpoint_dir.startswith('/content/drive/MyDrive'):
+            try:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                print(f"📁 Using Google Drive checkpoint directory: {checkpoint_dir}")
+            except OSError:
+                # If Google Drive is not mounted, fall back to local
+                checkpoint_dir = os.path.join(project_root, "checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                print(f"⚠️  Google Drive not available. Using local checkpoint directory: {checkpoint_dir}")
         else:
-            raise e
+            # If config has relative path, use it relative to project root
+            checkpoint_dir = os.path.join(project_root, checkpoint_dir)
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print(f"📁 Using checkpoint directory: {checkpoint_dir}")
+    else:
+        # Running on local system - always use local checkpoint directory
+        if checkpoint_dir.startswith('/content'):
+            # If config has Colab path but we're on local, use local directory
+            checkpoint_dir = os.path.join(project_root, "checkpoints")
+            print(f"💻 Local system detected. Using local checkpoint directory: {checkpoint_dir}")
+        elif not os.path.isabs(checkpoint_dir):
+            # Relative path - make it relative to project root
+            checkpoint_dir = os.path.join(project_root, checkpoint_dir)
+        else:
+            # Absolute path on local system - use as is
+            pass
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"📁 Using checkpoint directory: {checkpoint_dir}")
+    
+    # Create other directories
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(tensorboard_dir, exist_ok=True)
     writer = SummaryWriter(tensorboard_dir)
     
     # Training loop
@@ -581,14 +617,22 @@ def main():
     last_ckpt = os.path.join(checkpoint_dir, "yolov11_fusion_last.pt")
     if os.path.exists(last_ckpt):
         print("Resuming from last checkpoint")
+        # Clear GPU cache before loading checkpoint to avoid OOM
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         checkpoint = torch.load(last_ckpt, map_location=device)
         model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
+        if 'best_map' in checkpoint:
+            best_map = checkpoint.get('best_map', 0.0)
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scaler_state_dict' in checkpoint and scaler is not None:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        # Clear GPU cache after loading
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         print(f"Resuming from epoch {start_epoch}")
 
     for epoch in range(start_epoch, config['training']['epochs']):
@@ -598,6 +642,27 @@ def main():
         )
         print(f"Epoch {epoch+1}/{config['training']['epochs']}: "
               f"Loss={avg_loss:.4f}, Box={avg_box_loss:.4f}, Obj={avg_obj_loss:.4f}, Cls={avg_cls_loss:.4f}")
+        epoch_ckpt_path = os.path.join(
+            checkpoint_dir,
+            f"yolov11_fusion_epoch_{epoch+1}.pt"
+        )
+
+        checkpoint = {
+          'epoch': epoch,
+          'model_state_dict': model.state_dict(),
+          'optimizer_state_dict': optimizer.state_dict(),
+          'best_map': best_map
+        }
+
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+
+        torch.save(checkpoint, epoch_ckpt_path)
+
+        # Also keep/update a rolling "last" checkpoint
+        torch.save(checkpoint, os.path.join(checkpoint_dir, "yolov11_fusion_last.pt"))
+
+        print(f"✅ Epoch {epoch+1} checkpoint saved to {checkpoint_dir}", flush=True)
         
         # Update learning rate
         if scheduler is not None:
@@ -614,6 +679,9 @@ def main():
                 val_loader,
                 val_annotation_path,
                 config['model']['anchors'],
+                config['data']['img_size'],
+                config['evaluation']['conf_thres'],
+                config['evaluation']['iou_thres'],
                 device
             )
             writer.add_scalar('mAP@0.5', metrics['mAP@0.5'], epoch)
@@ -626,18 +694,6 @@ def main():
                 torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'yolov11_fusion_best.pt'))
             
             model.train()  # Set back to train mode
-        
-        # Save checkpoint
-        if (epoch + 1) % config['logging']['save_freq'] == 0:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_map': best_map
-            }
-            if scaler is not None:
-                checkpoint['scaler_state_dict'] = scaler.state_dict()
-            torch.save(checkpoint, os.path.join(checkpoint_dir, f'yolov11_fusion_epoch_{epoch+1}.pt'))
     
     # Save final model
     final_checkpoint = {

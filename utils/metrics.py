@@ -52,7 +52,7 @@ def evaluate_coco(model, dataloader, annotation_file, anchors, img_size, conf_th
         with torch.no_grad():
             predictions = model(rgb, ir)
         
-        detections = detections = decode_predictions(
+        detections = decode_predictions(
           predictions,
           anchors,
           strides=[8,16,32],

@@ -33,3 +33,4 @@ echo "Setup complete! Virtual environment is ready."
 echo "To activate the virtual environment, run: source venv/bin/activate"
 
 
+

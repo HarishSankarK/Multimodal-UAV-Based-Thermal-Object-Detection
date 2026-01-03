@@ -3,11 +3,11 @@ model:
   name: yolov11_fusion
   num_classes: 4
   classes: ['person', 'rider', 'bicycle', 'car']
-  img_size: 256  # Further reduced for faster training (can be increased to 320, 416 or 640 for better accuracy)
+  img_size: 416  # Matches default.yaml - can be increased to 640 for better accuracy
   anchors:
-    - [[4, 5], [6, 11], [12, 9]]  # Scale 1 (32x32 for 256) - scaled from 640 anchors
-    - [[11, 24], [24, 18], [23, 46]]  # Scale 2 (16x16 for 256)
-    - [[46, 35], [62, 78], [149, 130]]  # Scale 3 (8x8 for 256)
+    - [[7, 8], [10, 20], [21, 15]]  # Scale 1 (52x52 for 416) - scaled from 640 anchors [[10,13], [16,30], [33,23]]
+    - [[20, 40], [40, 29], [38, 77]]  # Scale 2 (26x26 for 416) - scaled from [[30,61], [62,45], [59,119]]
+    - [[75, 59], [101, 129], [242, 212]]  # Scale 3 (13x13 for 416) - scaled from [[116,90], [156,198], [373,326]]
   backbone:
     type: DualBackbone
     in_channels: 3
